@@ -30,6 +30,17 @@ use soroban_sdk::{
 // Data Types
 // ============================================================
 
+/// How a tier's price is denominated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TierPriceMode {
+    /// Fixed price in the payment token's base units (stroops).
+    Fixed(i128),
+    /// Price denominated in USD cents. Converted to payment-token base units
+    /// at mint/renewal time using the configured oracle's current rate.
+    USDDenominated(i128),
+}
+
 /// Membership tier defined by a creator
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,9 +48,9 @@ pub struct Tier {
     pub tier_id: u32,
     pub creator: Address,
     pub name: String,
-    pub price: i128,     // price in stroops (USDC base units)
-    pub duration: u64,   // duration in seconds
-    pub max_supply: u32, // 0 = unlimited
+    pub price: TierPriceMode, // fixed stroops or USD cents, see TierPriceMode
+    pub duration: u64,        // duration in seconds
+    pub max_supply: u32,      // 0 = unlimited
     pub minted: u32,
     pub active: bool,
 }
@@ -145,6 +156,63 @@ pub struct PendingEarning {
     pub released: bool,
     /// earning_id — unique per creator, assigned from PendingEarningCount(creator)
     pub earning_id: u64,
+}
+
+// ============================================================
+// Price Oracle
+// ============================================================
+
+/// Interface implemented by the external price oracle contract.
+///
+/// `get_price` returns `(price, timestamp)` where `price` is the USD cents
+/// value of one base unit of `token` at `timestamp` (ledger seconds).
+#[contractclient(name = "OracleClient")]
+pub trait OracleInterface {
+    fn get_price(env: Env, token: Address) -> (i128, u64);
+}
+
+/// Oracle data older than this (in seconds) is rejected as stale.
+const ORACLE_STALENESS_THRESHOLD_SECONDS: u64 = 300;
+
+/// Resolves the payment-token amount (base units) owed for `tier`.
+///
+/// Fixed-price tiers return their stored amount unchanged. USD-denominated
+/// tiers call the configured oracle for the current USD-cents price of
+/// `token`, reject stale or missing oracle data, and convert using 7-decimal
+/// fixed-point math: `usd_price_cents * 10_000_000 / oracle_price_cents`.
+///
+/// # Panics
+///
+/// - Panics with "Oracle data unavailable or stale" if no oracle is
+///   configured, the oracle reports a non-positive price, or the oracle's
+///   data is older than `ORACLE_STALENESS_THRESHOLD_SECONDS`.
+fn resolve_price_amount(env: &Env, tier: &Tier, token: &Address) -> i128 {
+    match &tier.price {
+        TierPriceMode::Fixed(amount) => *amount,
+        TierPriceMode::USDDenominated(usd_price_cents) => {
+            let usd_price_cents = *usd_price_cents;
+            let oracle_address: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::OracleContract)
+                .expect("Oracle data unavailable or stale");
+
+            let oracle_client = OracleClient::new(env, &oracle_address);
+            let (oracle_price_cents, timestamp) = oracle_client.get_price(token);
+
+            let now = env.ledger().timestamp();
+            assert!(
+                now.saturating_sub(timestamp) <= ORACLE_STALENESS_THRESHOLD_SECONDS,
+                "Oracle data unavailable or stale"
+            );
+            assert!(oracle_price_cents > 0, "Oracle data unavailable or stale");
+
+            usd_price_cents
+                .checked_mul(10_000_000)
+                .expect("Overflow computing token amount")
+                / oracle_price_cents
+        }
+    }
 }
 
 // ============================================================
@@ -257,6 +325,41 @@ impl StarPassContract {
         Ok(())
     }
 
+    /// Sets the price oracle contract used to convert USD-denominated tier
+    /// prices into payment-token amounts.
+    ///
+    /// Admin-only. `oracle_address` must implement `get_price(token: Address)
+    /// -> (price: i128, timestamp: u64)`, returning the USD-cents price of
+    /// one base unit of `token` and the ledger timestamp it was observed at.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the contract has not been initialized.
+    /// - Panics if `admin` does not match the stored admin.
+    pub fn set_oracle(env: Env, admin: Address, oracle_address: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        assert!(admin == stored_admin, "Not authorized");
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleContract, &oracle_address);
+
+        env.events()
+            .publish((Symbol::new(&env, "oracle_set"),), (admin, oracle_address));
+    }
+
+    /// Returns the configured price oracle contract address, if any.
+    ///
+    /// Read-only, no auth required.
+    pub fn get_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::OracleContract)
+    }
+
     /// Withdraws accumulated protocol fees to a recipient address.
     ///
     /// Admin-only. Transfers `amount` USDC directly from the contract to `recipient`.
@@ -353,6 +456,56 @@ impl StarPassContract {
         duration: u64,
         max_supply: u32,
     ) -> u32 {
+        assert!(price > 0, "Price must be greater than zero");
+        Self::create_tier_priced(
+            env,
+            creator,
+            name,
+            TierPriceMode::Fixed(price),
+            duration,
+            max_supply,
+        )
+    }
+
+    /// Creates a new membership tier priced in USD cents.
+    ///
+    /// Creator-only. Behaves like `create_tier`, but the tier's price is
+    /// denominated in USD cents and converted to the payment token's base
+    /// units at mint/renewal time using the oracle set via `set_oracle`.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the caller is not a registered creator.
+    /// - Panics if `usd_price_cents` is zero.
+    /// - Panics if `duration` is zero.
+    /// - Panics if `name` is empty.
+    pub fn create_tier_usd(
+        env: Env,
+        creator: Address,
+        name: String,
+        usd_price_cents: i128,
+        duration: u64,
+        max_supply: u32,
+    ) -> u32 {
+        assert!(usd_price_cents > 0, "Price must be greater than zero");
+        Self::create_tier_priced(
+            env,
+            creator,
+            name,
+            TierPriceMode::USDDenominated(usd_price_cents),
+            duration,
+            max_supply,
+        )
+    }
+
+    fn create_tier_priced(
+        env: Env,
+        creator: Address,
+        name: String,
+        price: TierPriceMode,
+        duration: u64,
+        max_supply: u32,
+    ) -> u32 {
         creator.require_auth();
         assert!(
             env.storage()
@@ -360,7 +513,6 @@ impl StarPassContract {
                 .has(&DataKey::Creator(creator.clone())),
             "Must register as creator first"
         );
-        assert!(price > 0, "Price must be greater than zero");
         assert!(duration > 0, "Duration must be greater than zero");
         assert!(!name.is_empty(), "Name cannot be empty");
 
@@ -375,7 +527,7 @@ impl StarPassContract {
             tier_id,
             creator: creator.clone(),
             name,
-            price,
+            price: price.clone(),
             duration,
             max_supply,
             minted: 0,
@@ -457,9 +609,13 @@ impl StarPassContract {
             .expect("Tier not found");
         assert!(tier.creator == creator, "Not the tier creator");
         assert!(tier.active, "Tier is not active");
+        assert!(
+            matches!(tier.price, TierPriceMode::Fixed(_)),
+            "Tier is USD-denominated; use update_tier_price_usd"
+        );
 
-        let old_price = tier.price;
-        tier.price = new_price;
+        let old_price = tier.price.clone();
+        tier.price = TierPriceMode::Fixed(new_price);
         env.storage()
             .persistent()
             .set(&DataKey::Tier(tier_id), &tier);
@@ -467,6 +623,51 @@ impl StarPassContract {
         env.events().publish(
             (Symbol::new(&env, "tier_price_updated"),),
             (tier_id, old_price, new_price),
+        );
+    }
+
+    /// Updates the USD-cents price of a USD-denominated tier for future purchases.
+    ///
+    /// Creator-only. Does not affect passes already minted. Requires creator
+    /// signature; the caller must own the tier and the tier must be active.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if `new_usd_price_cents` is zero.
+    /// - Panics if the tier does not exist.
+    /// - Panics if the caller is not the tier's creator.
+    /// - Panics if the tier is inactive.
+    /// - Panics if the tier is fixed-price.
+    pub fn update_tier_price_usd(
+        env: Env,
+        creator: Address,
+        tier_id: u32,
+        new_usd_price_cents: i128,
+    ) {
+        creator.require_auth();
+        assert!(new_usd_price_cents > 0, "Price must be greater than zero");
+
+        let mut tier: Tier = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Tier(tier_id))
+            .expect("Tier not found");
+        assert!(tier.creator == creator, "Not the tier creator");
+        assert!(tier.active, "Tier is not active");
+        assert!(
+            matches!(tier.price, TierPriceMode::USDDenominated(_)),
+            "Tier is fixed-price; use update_tier_price"
+        );
+
+        let old_price = tier.price.clone();
+        tier.price = TierPriceMode::USDDenominated(new_usd_price_cents);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Tier(tier_id), &tier);
+
+        env.events().publish(
+            (Symbol::new(&env, "tier_price_updated"),),
+            (tier_id, old_price, new_usd_price_cents),
         );
     }
 
@@ -512,13 +713,17 @@ impl StarPassContract {
             .get(&DataKey::ProtocolFeeBps)
             .unwrap_or(0);
 
+        // Resolve payment amount: Fixed tiers use their stored amount as-is;
+        // USDDenominated tiers convert via the configured oracle.
+        let price_amount = resolve_price_amount(&env, &tier, &token);
+
         // Calculate fee split
-        let protocol_fee = (tier.price * fee_bps as i128) / 10_000;
-        let creator_amount = tier.price - protocol_fee;
+        let protocol_fee = (price_amount * fee_bps as i128) / 10_000;
+        let creator_amount = price_amount - protocol_fee;
 
         // Transfer full price from fan to contract
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&fan, &env.current_contract_address(), &tier.price);
+        token_client.transfer(&fan, &env.current_contract_address(), &price_amount);
 
         // ESCROW: create PendingEarning instead of directly crediting creator balance
         // Earnings are locked for lock_period_seconds before becoming withdrawable.
@@ -661,13 +866,16 @@ impl StarPassContract {
             .get(&DataKey::ProtocolFeeBps)
             .unwrap_or(0);
 
+        // Resolve payment amount (same as mint_pass)
+        let price_amount = resolve_price_amount(&env, &tier, &token);
+
         // Calculate fee split (same as mint_pass)
-        let protocol_fee = (tier.price * fee_bps as i128) / 10_000;
-        let creator_amount = tier.price - protocol_fee;
+        let protocol_fee = (price_amount * fee_bps as i128) / 10_000;
+        let creator_amount = price_amount - protocol_fee;
 
         // Transfer full price from fan to contract
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&fan, &env.current_contract_address(), &tier.price);
+        token_client.transfer(&fan, &env.current_contract_address(), &price_amount);
 
         // ESCROW: create PendingEarning instead of directly crediting creator balance
         let earning_id = {
@@ -1675,6 +1883,41 @@ mod tests {
         (env, contract_id, admin, creator, fan, token)
     }
 
+    // --------------------------------------------------------
+    // Mock price oracle (test-only)
+    // --------------------------------------------------------
+
+    /// Minimal mock implementing `OracleInterface`. Price/timestamp are set
+    /// directly via `set_price` so tests can exercise fresh and stale data.
+    #[contract]
+    pub struct MockOracle;
+
+    #[contractimpl]
+    impl MockOracle {
+        pub fn set_price(env: Env, price: i128, timestamp: u64) {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "price"), &price);
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "ts"), &timestamp);
+        }
+
+        pub fn get_price(env: Env, _token: Address) -> (i128, u64) {
+            let price: i128 = env
+                .storage()
+                .instance()
+                .get(&Symbol::new(&env, "price"))
+                .expect("mock price not set");
+            let timestamp: u64 = env
+                .storage()
+                .instance()
+                .get(&Symbol::new(&env, "ts"))
+                .expect("mock timestamp not set");
+            (price, timestamp)
+        }
+    }
+
     #[test]
     fn test_initialize() {
         let env = Env::default();
@@ -1776,6 +2019,126 @@ mod tests {
         assert_eq!(pass.owner, fan);
         assert_eq!(pass.tier_id, tier_id);
         assert_eq!(pass.active, true);
+    }
+
+    // --------------------------------------------------------
+    // Oracle-based USD-denominated pricing
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_mint_pass_fixed_price_unaffected() {
+        // No oracle configured at all — a Fixed-price tier must mint fine.
+        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Bronze"),
+            &1_000_000i128,
+            &2_592_000u64,
+            &0u32,
+        );
+        let tier = client.get_tier(&tier_id);
+        assert_eq!(tier.price, TierPriceMode::Fixed(1_000_000));
+
+        let pass_id = client.mint_pass(&fan, &tier_id);
+        let pass = client.get_pass(&pass_id);
+        assert_eq!(pass.active, true);
+    }
+
+    #[test]
+    fn test_mint_pass_usd_denominated_correct_amount() {
+        let (env, contract_id, admin, creator, fan, token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        // Mock oracle: 1 token base unit = 10 USD cents.
+        let oracle_id = env.register_contract(None, MockOracle);
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let now = env.ledger().timestamp();
+        oracle_client.set_price(&10i128, &now);
+
+        client.set_oracle(&admin, &oracle_id);
+
+        // Tier priced at $10.00 (1000 cents).
+        let tier_id = client.create_tier_usd(
+            &creator,
+            &String::from_str(&env, "USD Tier"),
+            &1000i128,
+            &2_592_000u64,
+            &0u32,
+        );
+
+        // Expected token amount: 1000 * 10_000_000 / 10 = 1_000_000_000.
+        StellarAssetClient::new(&env, &token).mint(&fan, &2_000_000_000);
+
+        let pass_id = client.mint_pass(&fan, &tier_id);
+        assert!(client.get_pass(&pass_id).active);
+
+        env.ledger().set_timestamp(now + 3600 + 1);
+        let released = client.process_unlocked_earnings(&creator);
+        assert_eq!(released, 1u32);
+
+        // fee_bps = 250 (2.5%) → protocol_fee = 25_000_000, creator_amount = 975_000_000
+        assert_eq!(client.get_creator_balance(&creator), 975_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "Oracle data unavailable or stale")]
+    fn test_mint_pass_stale_oracle_panics() {
+        let (env, contract_id, admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let oracle_id = env.register_contract(None, MockOracle);
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let now = env.ledger().timestamp();
+        oracle_client.set_price(&10i128, &now);
+        client.set_oracle(&admin, &oracle_id);
+
+        let tier_id = client.create_tier_usd(
+            &creator,
+            &String::from_str(&env, "USD Tier"),
+            &1000i128,
+            &2_592_000u64,
+            &0u32,
+        );
+
+        // Advance beyond the 300-second staleness window.
+        env.ledger().set_timestamp(now + 301);
+
+        client.mint_pass(&fan, &tier_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Oracle data unavailable or stale")]
+    fn test_mint_pass_oracle_unavailable_panics() {
+        // No oracle configured — USD-denominated tier must panic on mint.
+        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let tier_id = client.create_tier_usd(
+            &creator,
+            &String::from_str(&env, "USD Tier"),
+            &1000i128,
+            &2_592_000u64,
+            &0u32,
+        );
+
+        client.mint_pass(&fan, &tier_id);
+    }
+
+    #[test]
+    fn test_set_oracle_rejects_non_admin() {
+        let (env, contract_id, _admin, _creator, _fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+
+        let oracle_id = env.register_contract(None, MockOracle);
+        let impostor = Address::generate(&env);
+        let result = client.try_set_oracle(&impostor, &oracle_id);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1921,7 +2284,7 @@ mod tests {
 
         client.update_tier_price(&creator, &tier_id, &2_000_000i128);
         let tier = client.get_tier(&tier_id);
-        assert_eq!(tier.price, 2_000_000);
+        assert_eq!(tier.price, TierPriceMode::Fixed(2_000_000));
     }
 
     #[test]
@@ -2340,7 +2703,8 @@ mod tests {
         let creator_profile = client.get_creator(&creator);
         assert_eq!(creator_profile.pass_count, 1);
         assert_eq!(creator_profile.total_earned, 1_950_000);
-        assert_eq!(client.get_creator_balance(&creator), 1_950_000);
+        // Earnings are escrowed until the lock period elapses.
+        assert_eq!(client.get_creator_balance(&creator), 0);
         let tier = client.get_tier(&tier_id);
         assert_eq!(tier.minted, 1);
         let pass = client.get_pass(&pass_id);
@@ -2360,7 +2724,7 @@ mod tests {
         let creator_profile = client.get_creator(&creator);
         assert_eq!(creator_profile.pass_count, 1);
         assert_eq!(creator_profile.total_earned, 1_950_000);
-        assert_eq!(client.get_creator_balance(&creator), 1_950_000);
+        assert_eq!(client.get_creator_balance(&creator), 0);
         let tier = client.get_tier(&tier_id);
         assert_eq!(tier.minted, 1);
         assert_eq!(tier.creator, creator);
@@ -2377,6 +2741,13 @@ mod tests {
 
         // has_valid_pass still works after migration
         assert!(client.has_valid_pass(&fan, &tier_id));
+
+        // Escrowed earnings still release correctly post-migration
+        let now = env.ledger().timestamp();
+        env.ledger().set_timestamp(now + 3600 + 1);
+        let released = client.process_unlocked_earnings(&creator);
+        assert_eq!(released, 1u32);
+        assert_eq!(client.get_creator_balance(&creator), 1_950_000);
 
         // Double-migration panics
         let result = client.try_migrate(&admin);
